@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	playfab "github.com/dgkanatsios/playfabsdk-go/sdk"
 	auth "github.com/dgkanatsios/playfabsdk-go/sdk/authentication"
@@ -24,6 +26,29 @@ type MatchRequest struct {
 type MatchInfo struct {
 	MatchId   string
 	QueueName string
+}
+
+type CommonHttpResponse struct {
+	Status     string
+	StatusCode int
+	Body       []byte
+}
+
+type PortInfo struct {
+	Game int
+}
+
+type GameyeMatchResponse struct {
+	Id       string
+	Image    string
+	Location string
+	Host     string
+	Created  int64
+	Port     PortInfo
+}
+
+type GameyeQueryMatchsResponse struct {
+	Match []GameyeMatchResponse
 }
 
 var logger *log.Logger
@@ -59,12 +84,15 @@ func InitPF() {
 	commonOutput(fmt.Sprintf("Title EntityToken: %s\n", entityToken))
 }
 
-func GameyeRequest(url string, method string, postData []byte) {
+func GameyeRequest(url string, method string, postData []byte, timeOut time.Duration) CommonHttpResponse {
 	req, err := http.NewRequest(method, gameyeUrl+url, bytes.NewBuffer(postData))
 	req.Header.Add("Authorization", "Bearer "+gameyeToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
+	if timeOut != 0 {
+		client.Timeout = timeOut
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		handleFail(fmt.Sprintf("GameyeAPIRequest %s Error: %s\n", url, err.Error()))
@@ -74,14 +102,52 @@ func GameyeRequest(url string, method string, postData []byte) {
 	commonOutput(fmt.Sprintf("GameyeAPIRequest %s response Status: %s, Headers: %s \n", url, resp.Status, resp.Header))
 	body, _ := ioutil.ReadAll(resp.Body)
 	commonOutput(fmt.Sprintf("GameyeAPIRequest %s response Body: %s\n", url, string(body)))
+
+	return CommonHttpResponse{Status: resp.Status, StatusCode: resp.StatusCode, Body: body}
 }
 
-func GameyePostRequest(url string, postData []byte) {
-	GameyeRequest(url, http.MethodPost, postData)
+func GameyePostRequest(url string, postData []byte, timeOut time.Duration) CommonHttpResponse {
+	return GameyeRequest(url, http.MethodPost, postData, timeOut)
 }
 
-func GameyeGetRequest(url string) {
-	GameyeRequest(url, http.MethodGet, []byte(""))
+func GameyeGetRequest(url string) CommonHttpResponse {
+	return GameyeRequest(url, http.MethodGet, []byte(""), 0)
+}
+
+func QueryGameyeMatches(matchId string, retryCount int) GameyeMatchResponse {
+	var res GameyeMatchResponse
+	stopped := false
+	ticker := time.NewTicker(3 * time.Second)
+	count := 0
+	for !stopped {
+		select {
+		case <-ticker.C:
+			count++
+			if count > retryCount {
+				ticker.Stop()
+				stopped = true
+				return res
+			}
+			r := GameyeGetRequest("query/match")
+			if r.StatusCode == 200 {
+				var resObj GameyeQueryMatchsResponse
+				err := json.Unmarshal(r.Body, &resObj)
+				if err != nil {
+				} else {
+					for _, match := range resObj.Match {
+						if match.Id == matchId {
+							ticker.Stop()
+							stopped = true
+							return match
+						}
+					}
+				}
+			}
+
+		}
+	}
+
+	return res
 }
 
 func main() {
@@ -90,7 +156,6 @@ func main() {
 	// ENTITY API - Get title level Entity Token
 	InitPF()
 
-	//
 	http.HandleFunc("/CreateSinglePlayerTicket", func(res http.ResponseWriter, req *http.Request) {
 		//Get Request Data
 		var data MatchRequest
@@ -145,7 +210,7 @@ func main() {
 		// set status header
 		res.WriteHeader(http.StatusOK)
 		// respond with a JSON string
-		fmt.Fprintf(res, `{"Status":"OK", "TicketId": %s}`, ticketId)
+		fmt.Fprintf(res, `{"Status": "OK", "TicketId": %s}`, ticketId)
 
 		//Then, move to /matchfound API to get Match info and notify Gameye
 	})
@@ -196,25 +261,49 @@ func main() {
 
 			commonOutput(fmt.Sprintf("GetMatch-Members: %s\n", prettyPrint(res3.Members)))
 			commonOutput(fmt.Sprintf("GetMatch-RegionPreferences: %s\n", prettyPrint(res3.RegionPreferences)))
+			var regions = res3.RegionPreferences
+			//var regions = []string{"ChinaEast2"} //Debug
 
-			// var jsonStr = []byte(`{
-			// 	"matchKey": "my-awesome-match",
-			// 	"gameKey": "shooter-game",
-			// 	"locationKeys": [
-			// 	  "eu-west"
-			// 	],
-			// 	"templateKey": "deathmatch",
-			// 	"config": {
-			// 	  "map": "de_dust"
-			// 	},
-			// 	"endCallbackUrl": "https://mybackend/matchid",
-			// 	"restart": true,
-			// 	"sortAdvantages": [
-			// 	  "price"
-			// 	]
-			//   }`)
-			// GameyePostRequest("command/start-match", jsonStr)
-			//GameyeGetRequest("query/match")
+			var str = `{
+				"matchKey": "` + data.MatchId + `",
+				"gameKey": "` + gameyeKey + `",
+				"locationKeys": ` + jsonMarshal(convertRegionsToLocations(regions)) + `,
+				"templateKey": "` + gameyeTemplateKey + `",
+				"config": {
+					"matchmakingType": 4,
+					"matchId": "` + data.MatchId + `",
+					"queueName": "` + data.QueueName + `"
+				}
+			  }`
+			str = polishStr(str)
+			commonOutput(fmt.Sprintf("Gameye startmatch post body: %s\n", str))
+			var jsonStr = []byte(str)
+			//In extreme cases it can take up 50 seconds to start a server, after which we produce a time-out. Please adjust the time-out settings of your client accordingly.
+			res := GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
+
+			if res.StatusCode == 409 {
+				commonOutput(fmt.Sprintf("Conflict, the matchid %s already be requested\n", data.MatchId))
+				//Call Gameye query/match
+				match := QueryGameyeMatches(data.MatchId, 10)
+				if match.Id == "" {
+					//Not Found in retry counts
+					commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
+				}
+			} else if res.StatusCode != 200 {
+				//Re-send start-match request or query match
+				match2 := QueryGameyeMatches(data.MatchId, 10)
+				if match2.Id == "" {
+					//Not Found in retry counts
+					commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
+				}
+			} else {
+				var resObj GameyeMatchResponse
+				err := json.Unmarshal(res.Body, &resObj)
+				if err != nil {
+					handleFail(fmt.Sprintf("Resolve Gameye start match api response error: %s\n", err.Error()))
+				}
+				commonOutput(fmt.Sprintf("Gameye Server Info - location: %s, host: %s, game port: %d\n", resObj.Location, resObj.Host, resObj.Port.Game))
+			}
 		}()
 	})
 
@@ -230,6 +319,18 @@ func commonOutput(msg string) {
 		fmt.Print(msg)
 	}
 	logger.Print(msg)
+}
+
+func polishStr(str string) string {
+	str = strings.ReplaceAll(str, "\t", "")
+	str = strings.ReplaceAll(str, "\n", "")
+	str = strings.ReplaceAll(str, " ", "")
+	return str
+}
+
+func jsonMarshal(i interface{}) string {
+	s, _ := json.Marshal(i)
+	return string(s)
 }
 
 func prettyPrint(i interface{}) string {
@@ -252,4 +353,33 @@ func composeJsonObj(s string) interface{} {
 	}
 
 	return jsonObj
+}
+
+//https://docs.gameye.com/docs/choosing-your-server-locations
+func convertRegionsToLocations(regions []string) []string {
+	for _, region := range regions {
+		switch region {
+		case "ChinaEast2":
+			return []string{"china-east"}
+		case "ChinaNorth2":
+			return []string{"china-north"}
+		case "NorthEurope":
+		case "WestEurope":
+		case "AustraliaEast":
+		case "AustraliaSoutheast":
+		case "SoutheastAsia":
+		case "BrazilSouth":
+		case "NorthCentralUs":
+		case "CentralUs":
+		case "SouthCentralUs":
+		case "EastAsia":
+		case "JapanEast":
+		case "JapanWest":
+		case "EastUs":
+		case "EastUs2":
+		case "SouthAfricaNorth":
+		case "WestUs":
+		}
+	}
+	return []string{}
 }
