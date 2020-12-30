@@ -270,9 +270,9 @@ func main() {
 				"locationKeys": ` + jsonMarshal(convertRegionsToLocations(regions)) + `,
 				"templateKey": "` + gameyeTemplateKey + `",
 				"config": {
-					"matchmakingType": 4,
-					"matchId": "` + data.MatchId + `",
-					"queueName": "` + data.QueueName + `"
+					"MatchmakingType": 4,
+					"MatchId": "` + data.MatchId + `",
+					"QueueName": "` + data.QueueName + `"
 				}
 			  }`
 			str = polishStr(str)
@@ -288,6 +288,18 @@ func main() {
 				if match.Id == "" {
 					//Not Found in retry counts
 					commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
+				}
+			} else if res.StatusCode == 503 {
+				//Re-send start-match request
+				res = GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
+
+				if res.StatusCode == 200 {
+					var resObj GameyeMatchResponse
+					err := json.Unmarshal(res.Body, &resObj)
+					if err != nil {
+						handleFail(fmt.Sprintf("Resolve Gameye start match api response error: %s\n", err.Error()))
+					}
+					commonOutput(fmt.Sprintf("Gameye Server Info - location: %s, host: %s, game port: %d\n", resObj.Location, resObj.Host, resObj.Port.Game))
 				}
 			} else if res.StatusCode != 200 {
 				//Re-send start-match request or query match
