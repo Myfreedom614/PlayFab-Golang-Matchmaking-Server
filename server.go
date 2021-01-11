@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -54,6 +55,11 @@ type GameyeQueryMatchsResponse struct {
 var logger *log.Logger
 var settings *playfab.Settings
 var entityToken string = ""
+var requestGameyePtr *bool
+
+func InitArg() {
+	requestGameyePtr = flag.Bool("rg", false, "is require Gameye server? By default is false")
+}
 
 func InitLog() {
 	logFile, err := os.OpenFile("./output.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -151,6 +157,8 @@ func QueryGameyeMatches(matchId string, retryCount int) GameyeMatchResponse {
 }
 
 func main() {
+	InitArg()
+
 	InitLog()
 
 	// ENTITY API - Get title level Entity Token
@@ -216,6 +224,7 @@ func main() {
 	})
 
 	http.HandleFunc("/matchfound", func(res http.ResponseWriter, req *http.Request) {
+		commonOutput(fmt.Sprint("Received matchfound request \n"))
 		var data MatchInfo
 		err := json.NewDecoder(req.Body).Decode(&data)
 		if err != nil || data.MatchId == "" || data.QueueName == "" {
@@ -261,39 +270,56 @@ func main() {
 
 			commonOutput(fmt.Sprintf("GetMatch-Members: %s\n", prettyPrint(res3.Members)))
 			commonOutput(fmt.Sprintf("GetMatch-RegionPreferences: %s\n", prettyPrint(res3.RegionPreferences)))
-			var regions = res3.RegionPreferences
-			//var regions = []string{"ChinaEast2"} //Debug
 
-			var str = `{
-				"matchKey": "` + data.MatchId + `",
-				"gameKey": "` + gameyeKey + `",
-				"locationKeys": ` + jsonMarshal(convertRegionsToLocations(regions)) + `,
-				"templateKey": "` + gameyeTemplateKey + `",
-				"config": {
-					"MatchmakingType": 4,
-					"MatchId": "` + data.MatchId + `",
-					"QueueName": "` + data.QueueName + `"
-				}
-			  }`
-			str = polishStr(str)
-			commonOutput(fmt.Sprintf("Gameye startmatch post body: %s\n", str))
-			var jsonStr = []byte(str)
-			//In extreme cases it can take up 50 seconds to start a server, after which we produce a time-out. Please adjust the time-out settings of your client accordingly.
-			res := GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
+			if *requestGameyePtr == true {
+				var regions = res3.RegionPreferences
+				//var regions = []string{"ChinaEast2"} //Debug
 
-			if res.StatusCode == 409 {
-				commonOutput(fmt.Sprintf("Conflict, the matchid %s already be requested\n", data.MatchId))
-				//Call Gameye query/match
-				match := QueryGameyeMatches(data.MatchId, 10)
-				if match.Id == "" {
-					//Not Found in retry counts
-					commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
-				}
-			} else if res.StatusCode == 503 {
-				//Re-send start-match request
-				res = GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
+				var str = `{
+						"matchKey": "` + data.MatchId + `",
+						"gameKey": "` + gameyeKey + `",
+						"locationKeys": ` + jsonMarshal(convertRegionsToLocations(regions)) + `,
+						"templateKey": "` + gameyeTemplateKey + `",
+						"config": {
+							"MatchmakingType": 4,
+							"MatchId": "` + data.MatchId + `",
+							"QueueName": "` + data.QueueName + `"
+						}
+					  }`
+				str = polishStr(str)
+				commonOutput(fmt.Sprintf("Gameye startmatch post body: %s\n", str))
+				var jsonStr = []byte(str)
+				//In extreme cases it can take up 50 seconds to start a server, after which we produce a time-out. Please adjust the time-out settings of your client accordingly.
+				res := GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
 
-				if res.StatusCode == 200 {
+				if res.StatusCode == 409 {
+					commonOutput(fmt.Sprintf("Conflict, the matchid %s already be requested\n", data.MatchId))
+					//Call Gameye query/match
+					match := QueryGameyeMatches(data.MatchId, 10)
+					if match.Id == "" {
+						//Not Found in retry counts
+						commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
+					}
+				} else if res.StatusCode == 503 {
+					//Re-send start-match request
+					res = GameyePostRequest("command/start-match", jsonStr, 50*time.Second)
+
+					if res.StatusCode == 200 {
+						var resObj GameyeMatchResponse
+						err := json.Unmarshal(res.Body, &resObj)
+						if err != nil {
+							handleFail(fmt.Sprintf("Resolve Gameye start match api response error: %s\n", err.Error()))
+						}
+						commonOutput(fmt.Sprintf("Gameye Server Info - location: %s, host: %s, game port: %d\n", resObj.Location, resObj.Host, resObj.Port.Game))
+					}
+				} else if res.StatusCode != 200 {
+					//Re-send start-match request or query match
+					match2 := QueryGameyeMatches(data.MatchId, 10)
+					if match2.Id == "" {
+						//Not Found in retry counts
+						commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
+					}
+				} else {
 					var resObj GameyeMatchResponse
 					err := json.Unmarshal(res.Body, &resObj)
 					if err != nil {
@@ -301,22 +327,9 @@ func main() {
 					}
 					commonOutput(fmt.Sprintf("Gameye Server Info - location: %s, host: %s, game port: %d\n", resObj.Location, resObj.Host, resObj.Port.Game))
 				}
-			} else if res.StatusCode != 200 {
-				//Re-send start-match request or query match
-				match2 := QueryGameyeMatches(data.MatchId, 10)
-				if match2.Id == "" {
-					//Not Found in retry counts
-					commonOutput(fmt.Sprintf("Not Found Gameye server for MatchId %s in retry counts", data.MatchId))
-				}
-			} else {
-				var resObj GameyeMatchResponse
-				err := json.Unmarshal(res.Body, &resObj)
-				if err != nil {
-					handleFail(fmt.Sprintf("Resolve Gameye start match api response error: %s\n", err.Error()))
-				}
-				commonOutput(fmt.Sprintf("Gameye Server Info - location: %s, host: %s, game port: %d\n", resObj.Location, resObj.Host, resObj.Port.Game))
 			}
 		}()
+
 	})
 
 	fmt.Printf("Starting server at port 9000\n")
